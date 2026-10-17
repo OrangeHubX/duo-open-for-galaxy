@@ -16,6 +16,8 @@ that isn't needed on a Galaxy Z Fold, including the live-wallpaper mode and the 
 - **Hand-overs between the screens that dip through black**, hiding the
   panel switching on and apps resizing or relaunching.
 
+**[⬇ Download the latest APK](https://github.com/OrangeHubX/duo-open-for-galaxy/releases/latest)**
+
 Developed and measured on a **Galaxy Z Fold 8 Ultra** (SM-F976B, Android 17).
 Other Galaxy Z Folds running One UI 5 (Android 13) or later should work the
 same way but are untested; reports welcome (see *Reporting a problem*).
@@ -50,8 +52,11 @@ draws a touch-transparent overlay above every window.
 
 ## Install
 
-1. Download `DuoOpen-<version>.apk` from [Releases](../../releases) and
-   install it.
+1. Download `DuoOpen-<version>.apk` from the
+   [latest release](https://github.com/OrangeHubX/duo-open-for-galaxy/releases/latest)
+   and install it. If the original Duo Open is installed, uninstall it
+   first: both use the app id `com.duoopen` but are signed differently, so
+   Android refuses to install one over the other.
 2. Open **Duo Open**, tap **Turn on** under *Whole-screen fold*, and enable
    *Duo Open full-screen fold* in Accessibility.
    - Android blocks accessibility for sideloaded apps until you allow it.
