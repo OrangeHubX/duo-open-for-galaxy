@@ -1,5 +1,6 @@
 package com.duoopen.overlay
 
+import android.app.KeyguardManager
 import android.content.Context
 import android.os.Handler
 import android.os.SystemClock
@@ -108,8 +109,11 @@ class EarlyScreenSwitch(
     private fun passed(target: Target, angle: Float): Boolean =
         if (target == Target.COVER) angle <= coverAngle() else angle >= innerAngle()
 
+    private val keyguard = context.getSystemService(KeyguardManager::class.java)
+
     private fun eligible(target: Target): Boolean {
-        if (!hinge.externalActive || !ShizukuBridge.ready) return false
+        // Locked, Samsung runs its own wake and lock-screen handling: leave the screens to it.
+        if (!hinge.externalActive || !ShizukuBridge.ready || keyguard?.isKeyguardLocked == true) return false
         val p = hinge.posture
         return when (target) {
             Target.COVER -> coverAngle() > 0f && (p == Posture.HALF_OPENED || p == Posture.OPENED)

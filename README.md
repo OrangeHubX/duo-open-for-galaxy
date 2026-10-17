@@ -34,12 +34,12 @@ how far it is from flat. As the hinge reaches 180° the picture settles into
 focus. Both screens take part:
 
 - **Opening:** the cover screen frosts in until the inner screen takes over
-  at about 85°. The inner screen then picks up fully frosted and clears as
-  you reach flat.
+  (at about 85°, or the angle you choose). The inner screen then picks up
+  fully frosted and clears as you reach flat.
 - **Closing:** the same in reverse.
 
-It works over *everything*: your own wallpaper, icons, widgets, the lock
-screen, whatever app is open. It runs as an accessibility service that
+It works over your own wallpaper, icons, widgets and whatever app is open,
+whenever the phone is unlocked. It runs as an accessibility service that
 draws a touch-transparent overlay above every window.
 
 ## Requirements
@@ -155,7 +155,8 @@ This is a device-state *base state override*, the same as
 `adb shell cmd device_state base-state 0`. Only which screen is used
 changes.
 
-Each override is held as briefly as possible. It is released:
+Neither is used while the phone is locked. Each override is held as
+briefly as possible. It is released:
 
 - **Cover:** once the hall sensor reports the phone shut. The sensor HAL
   logs this as `folding_angle device_mode(0 -> 1)`. Not sooner: while
@@ -186,7 +187,8 @@ The fold needs a picture of the screen to bend.
 Either way the picture lives in memory only while the overlay is up.
 Nothing is stored, logged or sent anywhere, and the app has no network
 permission. Screens the system marks secure (banking apps, DRM video) can't
-be captured, and the effect simply doesn't play there.
+be captured, and the effect simply doesn't play there. Nothing is captured
+while the phone is locked.
 
 For the hinge, the helper reads only the sensor HAL's tag
 (`logcat -s sensors-hal`). Of those lines it parses only the two hinge
@@ -196,6 +198,11 @@ service stops. None of it runs unless you authorise Duo Open in Shizuku.
 
 ## Known limits
 
+- **No effect on the lock screen.** While the phone is locked, folding plays
+  Samsung's own transitions and the screens switch at the system's angles.
+  As the lock screen wakes, Samsung runs its own animation and face unlock,
+  and the screen can't be captured reliably for about a second, which made
+  the frost flicker. The first fold after unlocking plays as usual.
 - **A short wait at the start of a movement.** A sensor logs only once it
   has moved a full step, so the first reading of a fold arrives after ~5–10°
   of movement. From then on the frost follows continuously.
@@ -281,26 +288,18 @@ settings/DuoSettings.kt          shared tuning (SharedPreferences + StateFlow)
 - **Samsung's panel transition.** Samsung plays its own transition on the
   inner panel for ~0.4 s after it lights up (launcher fading in, no bars),
   so captures from then aren't used.
+- **Lock screen.** Waking into the lock screen, captures report secure
+  content and come back dark for up to ~1 s (the wake fade and face
+  unlock), which is why the effect is off while locked.
+- **Live blur.** One UI has SurfaceFlinger window blur disabled, so Live
+  blur is greyed out and only Snapshot is available.
 - **GPU time.** With the shader pyramid at 1/2.5 resolution, GPU time is ~5
   ms median and ~8 ms at the 99th percentile, on the inner panel at 120 Hz.
-
-## Galaxy Z Fold 8 notes
-
-- Measured 2026-09-26 (SM-F971B, Android 17). Display 1 is the inner panel
-  (2448×1848), flagged `FLAG_PRESENTATION` and off whenever the phone is
-  closed. On a normal open the OS turns the cover off and puts the inner
-  panel under display 0. Its `CONCURRENT_INNER/OUTER_DEFAULT` states are
-  only entered when an app asks for dual screen. The service accepts the
-  second built-in display when that happens, because it matches the default
-  display's name, "Built-in Screen".
-- One UI has SurfaceFlinger window blur disabled, so **Live blur** is greyed
-  out and only Snapshot is available.
 
 ## Related projects
 
 - [marcoazeem/duo-open](https://github.com/marcoazeem/duo-open): the
-  original Duo Open, for foldables in general, with a live-wallpaper mode
-  and a lite edition.
+  original Duo Open, for Android foldables in general.
 - [joeconsorti/duo-fold-live](https://github.com/joeconsorti/duo-fold-live):
   a Fold-8-only take on the same idea.
 - [ServerReset/duo-open](https://github.com/ServerReset/duo-open) and

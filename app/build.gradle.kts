@@ -23,8 +23,8 @@ android {
         // HAL behaviour this build relies on is from One UI 5 (Android 13) on.
         minSdk = 33
         targetSdk = 35
-        versionCode = 6
-        versionName = "2.0.0"
+        versionCode = 7
+        versionName = "2.0.1"
     }
 
     signingConfigs {

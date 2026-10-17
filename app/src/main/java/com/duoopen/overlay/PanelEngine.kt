@@ -1,6 +1,7 @@
 package com.duoopen.overlay
 
 import android.accessibilityservice.AccessibilityService
+import android.app.KeyguardManager
 import android.graphics.Bitmap
 import android.os.Handler
 import android.os.SystemClock
@@ -234,6 +235,14 @@ class PanelEngine(
             return
         }
         if (phase != Phase.IDLE) return
+        if (locked()) {
+            // The lock screen is Samsung's: it wakes with its own animation
+            // and can't be captured reliably while it does. Sit the fold out;
+            // the next one from rest after unlocking plays as usual.
+            panelSwitched = false
+            restArmed = false
+            return
+        }
         when {
             panelSwitched -> {
                 panelSwitched = false
@@ -272,6 +281,10 @@ class PanelEngine(
         stalledAt = Float.NaN
     }
 
+    /** The lock screen is up. */
+    private fun locked(): Boolean =
+        service.getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == true
+
     /** Live blur needs no capture: the system blurs whatever is on screen. */
     private fun liveMode(): Boolean =
         DuoSettings.config.value.liveBlur &&
@@ -290,7 +303,7 @@ class PanelEngine(
         if (afterSwap && startTilt == null && shellCapture()) {
             phase = Phase.CAPTURING
             val bounds = windowManager.maximumWindowMetrics.bounds
-            val placeholder = cache.get(innerPanel, bounds.width(), bounds.height()) ?: BLACK_PLACEHOLDER
+            val placeholder = cache.get(innerPanel, bounds.width(), bounds.height(), locked()) ?: BLACK_PLACEHOLDER
             presentingBridge = true
             present(placeholder, afterSwap = true, startTilt = null, t0 = SystemClock.uptimeMillis())
             presentingBridge = false
@@ -302,7 +315,7 @@ class PanelEngine(
         // capture when it lands — the frost hides the difference.
         if (afterSwap && startTilt == null && DuoSettings.config.value.instantStart) {
             val bounds = windowManager.maximumWindowMetrics.bounds
-            val stale = cache.get(innerPanel, bounds.width(), bounds.height())
+            val stale = cache.get(innerPanel, bounds.width(), bounds.height(), locked())
             if (stale != null) {
                 phase = Phase.CAPTURING
                 Log.i(TAG, "display $displayId: bridging with a ${cache.ageMs(innerPanel)}ms-old snapshot")
@@ -445,7 +458,7 @@ class PanelEngine(
     }
 
     private fun onCaptured(bitmap: Bitmap, afterSwap: Boolean, startTilt: Float?, t0: Long) {
-        cache.put(innerPanel, bitmap)
+        cache.put(innerPanel, bitmap, locked())
         if (bridging) {
             bridging = false
             val s = surface as? SnapshotSurface
@@ -704,7 +717,7 @@ class PanelEngine(
                                 target.replaceSnapshot(shot.bitmap, shot.pyramid, SETTLED_FADE_MS)
                                 shownSignature = shot.signature
                             }
-                            cache.put(innerPanel, shot.bitmap)
+                            cache.put(innerPanel, shot.bitmap, locked())
                             bridging = false
                             settle = false
                         }
