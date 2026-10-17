@@ -1,14 +1,9 @@
 package com.duoopen.ui
 
-import android.app.WallpaperManager
-import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.provider.Settings
 import android.widget.Toast
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.PickVisualMediaRequest
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
@@ -22,15 +17,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.LifecycleResumeEffect
@@ -43,12 +36,9 @@ import com.duoopen.fold.isInnerPanel
 import com.duoopen.overlay.OverlayFeature
 import com.duoopen.overlay.OverlayState
 import com.duoopen.settings.DuoSettings
-import com.duoopen.wallpaper.DuoWallpaperService
-import com.duoopen.wallpaper.WallpaperImage
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 @Composable
 fun DuoApp(foldLineFlow: StateFlow<FoldLine?>, dualScreen: DualScreen? = null) {
@@ -57,12 +47,46 @@ fun DuoApp(foldLineFlow: StateFlow<FoldLine?>, dualScreen: DualScreen? = null) {
     val config by DuoSettings.config.collectAsStateWithLifecycle()
     val foldLine by foldLineFlow.collectAsStateWithLifecycle()
 
-    var hingeAngle by remember { mutableFloatStateOf(Float.NaN) }
-    val hinge = remember { HingeAngleSource(context.applicationContext) { hingeAngle = it } }
-    DisposableEffect(hinge) {
-        hinge.start()
-        onDispose { hinge.stop() }
+    var resumeTick by remember { mutableIntStateOf(0) }
+    LifecycleResumeEffect(Unit) {
+        resumeTick++
+        onPauseOrDispose { }
     }
+    val overlayEnabled = remember(resumeTick) { OverlayFeature.isEnabled(context) }
+    val liveBlurSupported = remember(resumeTick) { OverlayFeature.liveBlurSupported(context) }
+    val supportedDevice = remember { OverlayFeature.supportedDevice(context) }
+    val overlayRunning by OverlayState.running.collectAsStateWithLifecycle()
+    val shizukuStatus by OverlayFeature.shizukuStatus.collectAsStateWithLifecycle()
+    LaunchedEffect(resumeTick) { OverlayFeature.refreshShizuku() }
+    val dualStatus by (dualScreen?.status ?: MutableStateFlow("")).collectAsStateWithLifecycle()
+    val dualActive by (dualScreen?.active ?: MutableStateFlow(false)).collectAsStateWithLifecycle()
+
+    // The overlay service's hinge has Samsung's real angle (Shizuku); the
+    // app's own only has the platform sensor's 0/90/180 stops.
+    var localAngle by remember { mutableFloatStateOf(Float.NaN) }
+    val localHinge = remember { HingeAngleSource(context.applicationContext) { localAngle = it } }
+    DisposableEffect(localHinge) {
+        localHinge.start()
+        onDispose { localHinge.stop() }
+    }
+    val serviceHinge = remember(resumeTick, overlayEnabled, shizukuStatus) { OverlayFeature.hinge() }
+    val hinge = serviceHinge ?: localHinge
+    var serviceAngle by remember { mutableFloatStateOf(Float.NaN) }
+    var tracked by remember { mutableStateOf(false) }
+    if (serviceHinge != null) {
+        LaunchedEffect(serviceHinge) {
+            // Every frame while the hinge moves; a few times a second at rest.
+            var still = 0
+            while (true) {
+                val a = withFrameNanos { now -> serviceHinge.estimate(now) }
+                still = if (a == serviceAngle) still + 1 else 0
+                serviceAngle = a
+                tracked = serviceHinge.externalFeedRunning
+                if (still > STILL_FRAMES) kotlinx.coroutines.delay(REST_POLL_MS)
+            }
+        }
+    }
+    val hingeAngle = if (serviceHinge != null && serviceAngle.isFinite()) serviceAngle else localAngle
 
     // Without a hinge sensor (emulator, non-foldable) the slider is the only input.
     var simulate by rememberSaveable { mutableStateOf(hinge.sensor == null) }
@@ -80,49 +104,39 @@ fun DuoApp(foldLineFlow: StateFlow<FoldLine?>, dualScreen: DualScreen? = null) {
 
     val shader = remember { DuoShader.create(context) }
     val pxPerMm = remember(context) { DuoShader.pxPerMm(context) }
-    val image by produceState<ImageBitmap?>(null, config.imageVersion) {
-        value = withContext(Dispatchers.IO) {
-            WallpaperImage.load(context.applicationContext, config.imageVersion).asImageBitmap()
-        }
-    }
-
-    var resumeTick by remember { mutableIntStateOf(0) }
-    LifecycleResumeEffect(Unit) {
-        resumeTick++
-        onPauseOrDispose { }
-    }
-    val wallpaperActive = remember(resumeTick) { isWallpaperActive(context) }
-    val overlayEnabled = remember(resumeTick) { OverlayFeature.isEnabled(context) }
-    val liveBlurSupported = remember(resumeTick) { OverlayFeature.liveBlurSupported(context) }
-    val overlayRunning by OverlayState.running.collectAsStateWithLifecycle()
-    val shizukuStatus by OverlayFeature.shizukuStatus.collectAsStateWithLifecycle()
-    LaunchedEffect(resumeTick) { OverlayFeature.refreshShizuku() }
-    val foldWallpaper = remember(resumeTick) { OverlayFeature.foldWallpaperActive(context) }
-    val dualStatus by (dualScreen?.status ?: kotlinx.coroutines.flow.MutableStateFlow("")).collectAsStateWithLifecycle()
-    val dualActive by (dualScreen?.active ?: kotlinx.coroutines.flow.MutableStateFlow(false)).collectAsStateWithLifecycle()
-
-    val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-        if (uri != null) {
-            scope.launch {
-                val ok = withContext(Dispatchers.IO) {
-                    runCatching { WallpaperImage.import(context.applicationContext, uri) }.isSuccess
-                }
-                if (!ok) Toast.makeText(context, "Couldn't load that image", Toast.LENGTH_SHORT).show()
-            }
-        }
-    }
-    val setWallpaper = { openWallpaperPicker(context) }
 
     var showSheet by remember { mutableStateOf(false) }
+    val onShizuku = {
+        // Running and waiting for us: ask. Otherwise it needs starting (or installing) first.
+        if (OverlayFeature.shizukuNeedsPermission()) OverlayFeature.requestShizuku() else openShizuku(context)
+    }
+    val playFold = {
+        showSheet = false
+        // Let the sheet finish closing so it isn't in the snapshot.
+        scope.launch {
+            kotlinx.coroutines.delay(450)
+            if (!OverlayFeature.playDemo()) {
+                Toast.makeText(context, "Turn on the whole-screen fold first", Toast.LENGTH_SHORT).show()
+            }
+        }
+        Unit
+    }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         HomePreview(
-            image = image,
             hingeAngle = angle,
             paneTilt = paneTilt,
             simulated = simulate,
-            wallpaperActive = wallpaperActive,
-            onSetWallpaper = setWallpaper,
+            tracked = !simulate && tracked,
+            setup = SetupState(
+                overlayEnabled = overlayEnabled,
+                shizukuReady = OverlayFeature.shizukuReady(),
+                shizukuInstalled = OverlayFeature.shizukuInstalled(),
+                supportedDevice = supportedDevice,
+            ),
+            onEnableOverlay = { openAccessibilitySettings(context) },
+            onShizuku = onShizuku,
+            onTest = playFold,
             onTune = { showSheet = true },
             modifier = if (shader != null && !overlayRunning) {
                 Modifier.foldEffect(shader, { paneTilt }, config, pxPerMm, foldLine)
@@ -141,63 +155,34 @@ fun DuoApp(foldLineFlow: StateFlow<FoldLine?>, dualScreen: DualScreen? = null) {
                 onSimulateChange = { simulate = it },
                 simulatedAngle = simulatedAngle,
                 onSimulatedAngleChange = { simulatedAngle = it },
-                onPickImage = {
-                    pickImage.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-                },
-                onDefaultImage = { WallpaperImage.reset(context.applicationContext) },
-                onSetWallpaper = setWallpaper,
-                wallpaperActive = wallpaperActive,
-                overlayAvailable = OverlayFeature.AVAILABLE,
                 overlayEnabled = overlayEnabled,
                 liveBlurSupported = liveBlurSupported,
                 dualStatus = dualStatus,
-                shizukuAvailable = OverlayFeature.SHIZUKU_AVAILABLE,
                 shizukuStatus = shizukuStatus,
                 shizukuReady = OverlayFeature.shizukuReady(),
                 shizukuInstalled = OverlayFeature.shizukuInstalled(),
-                onShizukuAuthorize = { OverlayFeature.requestShizuku() },
+                onShizukuAuthorize = onShizuku,
                 onOpenShizuku = { openShizuku(context) },
-                foldWallpaperActive = foldWallpaper,
                 angleFeedStatus = { OverlayFeature.angleFeedStatus() },
-                onOpenWallpaperSettings = { openWallpaperSettings(context) },
                 dualActive = dualActive,
                 onDualChange = { on -> if (on) dualScreen?.start() else dualScreen?.stop() },
                 onEnableOverlay = { openAccessibilitySettings(context) },
-                onTestOverlay = {
-                    showSheet = false
-                    // Let the sheet finish closing so it isn't in the snapshot.
-                    scope.launch {
-                        kotlinx.coroutines.delay(450)
-                        if (!OverlayFeature.playDemo()) {
-                            Toast.makeText(context, "Turn on the full-screen fold first", Toast.LENGTH_SHORT).show()
-                        }
-                    }
-                },
+                onTestOverlay = playFold,
                 onDismiss = { showSheet = false },
             )
         }
     }
 }
 
-private fun wallpaperComponent(context: Context) =
-    ComponentName(context, DuoWallpaperService::class.java)
-
-private fun isWallpaperActive(context: Context): Boolean =
-    WallpaperManager.getInstance(context).wallpaperInfo?.component == wallpaperComponent(context)
+private const val STILL_FRAMES = 30
+private const val REST_POLL_MS = 120L
 
 private fun openShizuku(context: Context) {
-    val launch = context.packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")
+    val launch = OverlayFeature.shizukuPackage()?.let { context.packageManager.getLaunchIntentForPackage(it) }
     val intent = launch ?: Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://shizuku.rikka.app/"))
     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     if (runCatching { context.startActivity(intent) }.isFailure) {
         Toast.makeText(context, "Couldn't open Shizuku", Toast.LENGTH_SHORT).show()
-    }
-}
-
-private fun openWallpaperSettings(context: Context) {
-    val intent = Intent(Intent.ACTION_SET_WALLPAPER).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-    if (runCatching { context.startActivity(intent) }.isFailure) {
-        Toast.makeText(context, "Couldn't open wallpaper settings", Toast.LENGTH_SHORT).show()
     }
 }
 
@@ -207,14 +192,4 @@ private fun openAccessibilitySettings(context: Context) {
     if (runCatching { context.startActivity(intent) }.isFailure) {
         Toast.makeText(context, "Couldn't open Accessibility settings", Toast.LENGTH_SHORT).show()
     }
-}
-
-private fun openWallpaperPicker(context: Context) {
-    val direct = Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER)
-        .putExtra(WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT, wallpaperComponent(context))
-    val chooser = Intent(WallpaperManager.ACTION_LIVE_WALLPAPER_CHOOSER)
-    for (intent in listOf(direct, chooser)) {
-        if (runCatching { context.startActivity(intent) }.isSuccess) return
-    }
-    Toast.makeText(context, "No live wallpaper picker found", Toast.LENGTH_SHORT).show()
 }

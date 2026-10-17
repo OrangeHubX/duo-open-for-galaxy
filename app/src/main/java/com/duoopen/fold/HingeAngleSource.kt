@@ -82,31 +82,161 @@ class HingeAngleSource(
     val isCoarse: Boolean
         get() = !externalActive && (active ?: candidates.firstOrNull())?.looksCoarse == true
 
+    /** Stops only, and no continuous source standing by either. */
+    val stopsOnly: Boolean get() = isCoarse && !externalFeedRunning
+
     private var active: Stats? = null
     private var started = false
 
     /**
      * A continuous angle fed from outside the sensor framework (Shizuku mode:
-     * Samsung's fold wallpaper reports it). While fresh it overrides the
-     * sensors, which on a Galaxy Z Fold only give 0/90/180.
+     * Samsung's sensor HAL logs it). While fresh it overrides the sensors,
+     * which on a Galaxy Z Fold only give 0/90/180.
      */
     var externalActive = false
         private set
     private var externalLastUptime = 0L
 
-    fun feedExternal(angle: Float) {
-        if (!angle.isFinite()) return
+    /** Fills in the hinge between the external source's sparse readings. */
+    private val tracker = HingeTracker()
+
+    /**
+     * @param source which of Samsung's hinge sensors logged it
+     *   ([HingeTracker.SOURCE_FOLDING], [HingeTracker.SOURCE_LID]) or
+     *   [HingeTracker.SOURCE_OTHER].
+     */
+    fun feedExternal(angle: Float, sampleUptimeMs: Long = SystemClock.uptimeMillis(), source: Int = HingeTracker.SOURCE_OTHER) {
+        // Closed, the sensors' last words are late log lines.
+        if (!angle.isFinite() || (posture == Posture.CLOSED && !closedOverride)) return
         val now = SystemClock.uptimeMillis()
+        val value = angle.coerceIn(0f, 180f)
+        if (!externalActive) tracker.reset(lastAngle.takeIf { it.isFinite() } ?: value, now * 1_000_000L)
         externalActive = true
         externalLastUptime = now
         lastEventUptime = now
         tickRate(now)
-        lastAngle = angle.coerceIn(0f, 180f)
+        tracker.add(value, sampleUptimeMs.coerceIn(now - MAX_SAMPLE_AGE_MS, now) * 1_000_000L, source)
+        lastAngle = value
         onAngle(lastAngle)
     }
 
     fun clearExternal() {
         externalActive = false
+    }
+
+    /**
+     * The hinge angle at [nowNanos] (System.nanoTime() clock): between the
+     * external source's readings, where the hinge has got to since; otherwise
+     * just the latest reading.
+     */
+    fun estimate(nowNanos: Long = System.nanoTime()): Float =
+        if (externalActive) tracker.estimate(nowNanos).takeIf { it.isFinite() } ?: lastAngle else lastAngle
+
+    /**
+     * Whether the hinge has surely reached [estimate] at [nowNanos]: moving at
+     * its measured speed and well short of where the next reading is due, so
+     * not just gliding on in the hope that it kept going.
+     */
+    fun estimateIsSure(nowNanos: Long = System.nanoTime()): Boolean = externalActive && tracker.cruising(nowNanos)
+
+    /** Coarse fold posture from the system's device state, where the platform exposes one. */
+    enum class Posture(val angle: Float) { CLOSED(0f), TENT(45f), HALF_OPENED(90f), OPENED(180f) }
+
+    /** Latest posture, or null if the device state isn't available. */
+    var posture: Posture? = null
+        private set
+
+    /** A continuous source is running, even if the hinge is still and it has nothing to say. */
+    var externalFeedRunning = false
+
+    /**
+     * The system has been told the phone is shut before it is (to light the
+     * cover screen early), so a CLOSED posture says nothing about the hinge.
+     */
+    var closedOverride = false
+
+    /**
+     * The early cover switch has handed the posture back. When it did so
+     * because the phone is [shut], settle on 0° (the hinge sensors' last log
+     * line is a few degrees short of it, and the posture, CLOSED all along,
+     * won't change to say so).
+     */
+    fun endClosedOverride(shut: Boolean = false) {
+        if (!closedOverride) return
+        closedOverride = false
+        if (!shut || posture != Posture.CLOSED) return
+        externalActive = false
+        lastEventUptime = SystemClock.uptimeMillis()
+        lastAngle = Posture.CLOSED.angle
+        tracker.reset(lastAngle, lastEventUptime * 1_000_000L)
+        onAngle(lastAngle)
+    }
+
+    /**
+     * Hinge angle at which a close hands over to the cover screen, when the app
+     * moves that earlier than the system does; NaN otherwise.
+     */
+    var coverTakeoverHinge = Float.NaN
+
+    /**
+     * Hinge angle at which an open hands over to the inner screen, when the
+     * app moves that earlier than the system does; NaN otherwise.
+     */
+    var innerTakeoverHinge = Float.NaN
+
+    /** The system has been told the phone is half open before it is (to light the inner screen early). */
+    var openOverride = false
+
+    private var learnedSwapHinge = Float.NaN
+
+    /**
+     * Hinge angle at which this phone hands over from the cover to the inner
+     * panel: learned from the device state when there is one (≈85° on a Z
+     * Fold 8 Ultra), else the OnePlus Open's ~20°.
+     */
+    val panelSwapHinge: Float
+        get() = when {
+            innerTakeoverHinge.isFinite() -> innerTakeoverHinge
+            learnedSwapHinge.isFinite() -> learnedSwapHinge
+            posture != null -> POSTURE_SWAP_HINGE
+            else -> DuoShader.PANEL_ON_HINGE
+        }
+
+    /**
+     * The device state changes well before a stops-only sensor does (on a Z Fold
+     * 8 Ultra TENT arrives ~0.4 s before the first 90° report, and a slow open
+     * may never report 90° before the panels swap). CLOSED is authoritative
+     * and ends any external feed, whose last reading would otherwise linger;
+     * the open postures stand in for the angle only while no continuous
+     * source is live.
+     */
+    fun feedPosture(p: Posture) {
+        if (p == posture) return
+        val at = estimate()
+        if (p == Posture.HALF_OPENED && posture == Posture.TENT && externalActive && !openOverride && at in 30f..140f) {
+            // Opening: this is where the panels swap. Learn it so the cover
+            // can be fully frosted right there rather than at a guess.
+            learnedSwapHinge = if (learnedSwapHinge.isNaN()) at else learnedSwapHinge + (at - learnedSwapHinge) * 0.3f
+        }
+        posture = p
+        if (p == Posture.CLOSED && closedOverride) {
+            // Our own early switch to the cover: the hinge is still mid-close.
+            return
+        } else if (p == Posture.CLOSED) {
+            externalActive = false
+        } else if (externalFeedRunning) {
+            // Real angles are on their way (Samsung's sensor log covers every
+            // posture); a stand-in would only make the frost jump.
+            return
+        } else if (p == Posture.TENT) {
+            externalActive = false
+        } else if (externalActive && SystemClock.uptimeMillis() - externalLastUptime < EXTERNAL_STALE_MS) {
+            return
+        }
+        lastEventUptime = SystemClock.uptimeMillis()
+        lastAngle = p.angle
+        tracker.reset(lastAngle, lastEventUptime * 1_000_000L)
+        onAngle(lastAngle)
     }
     private var lastEventUptime = 0L
     private var rateWindowStart = 0L
@@ -118,10 +248,11 @@ class HingeAngleSource(
 
     /** One line for the UI: which sensor, how fine, how fast, what it says. */
     fun statusText(): String {
-        if (externalActive) {
-            val raw = if (lastAngle.isNaN()) "—" else "%.1f°".format(lastAngle)
-            val rate = if (rateHz > 0f) "%.0f Hz".format(rateHz) else "idle"
-            return "Samsung fold wallpaper via Shizuku · continuous · $rate · raw $raw · ${lastEventAgeMs()} ms ago"
+        if (externalActive || externalFeedRunning) {
+            val raw = if (lastAngle.isNaN()) "—" else "%.0f°".format(lastAngle)
+            val age = lastEventAgeMs()
+            val ageText = if (age == Long.MAX_VALUE) "none yet" else "${age / 1000} s ago"
+            return "Samsung hinge sensors via Shizuku, tracked between readings · last reading $raw, $ageText"
         }
         val s = active ?: candidates.firstOrNull() ?: return "No hinge sensor found on this device"
         val res = if (s.resolution >= 1f) "${s.resolution.roundToInt()}°" else "%.2f°".format(s.resolution)
@@ -198,11 +329,16 @@ class HingeAngleSource(
         if (!value.isFinite() || value < -PLAUSIBLE_SLACK || value > 180f + PLAUSIBLE_SLACK) return
         stats.observe(value)
         if (choose() !== stats) return
+        // A stops-only sensor knows less than the device state, reports later,
+        // and on a Z Fold 8 Ultra even sends a stale 0° mid-TENT; with a
+        // posture available it only feeds the statistics.
+        if (posture != null && stats.looksCoarse) return
 
         val now = SystemClock.uptimeMillis()
         lastEventUptime = now
         tickRate(now)
         lastAngle = value.coerceIn(0f, 180f)
+        tracker.reset(lastAngle, now * 1_000_000L)
         onAngle(lastAngle)
     }
 
@@ -276,6 +412,10 @@ class HingeAngleSource(
         const val COARSE_MIN_EVENTS = 6
         const val MAX_DISTINCT = 8
         const val EXTERNAL_STALE_MS = 3_000L
+        /** A reading claiming to be older than this is mistimed; clamp it. */
+        const val MAX_SAMPLE_AGE_MS = 300L
+        /** Where a device-state phone swaps panels before it has been seen to (Z Fold 8 Ultra: HALF_OPENED at ~83–86°). */
+        const val POSTURE_SWAP_HINGE = 85f
         val STOPS = intArrayOf(0, 90, 180)
     }
 }

@@ -19,6 +19,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.abs
 
 /**
  * The fold effect on one lit display: screenshot → touch-transparent overlay
@@ -69,6 +70,8 @@ class PanelEngine(
     private var phase = Phase.IDLE
     private var surface: FoldSurface? = null
     private var follower: TiltFollower? = null
+    /** Smooths the hinge angle for [handoverDim]. */
+    private var dimFollower: TiltFollower? = null
 
     /** Which panel this display is driving; the effect restarts whenever it flips mid-fold. */
     var innerPanel = display.isInnerPanel()
@@ -88,6 +91,15 @@ class PanelEngine(
     private var bridging = false
     /** Live re-capture loop (Shizuku mode) is scheduled. */
     private var liveLoop = false
+    /** The overlay being put up is the bridge picture: show it at once, no fade over the waking panel. */
+    private var presentingBridge = false
+    /** Hinge angle at which the inner panel is fully frosted: where it lit up on this open. */
+    private var innerFullAt = restInnerFullAt()
+    /** Hinge angle at which the cover panel is fully frosted: where it lit up on this close; NaN = the open's swap angle. */
+    private var coverFullAt = Float.NaN
+
+    /** From rest the inner panel frosts fully by the time it would hand over to the cover. */
+    private fun restInnerFullAt(): Float = hinge.coverTakeoverHinge.takeIf { it.isFinite() } ?: DuoShader.PANEL_ON_HINGE
 
     val showing: Boolean get() = phase == Phase.SHOWING
 
@@ -95,13 +107,29 @@ class PanelEngine(
         override fun run() {
             val o = surface ?: return
             if (o.tilt < DuoShader.FLAT_EPSILON) return
-            if (!demoRunning && SystemClock.uptimeMillis() - lastHingeMoveMs >= SETTLE_TIMEOUT_MS) {
+            val timeout = settleTimeoutMs()
+            if (!demoRunning && SystemClock.uptimeMillis() - lastHingeMoveMs >= timeout) {
+                stalledAt = hinge.lastAngle
                 dismiss(fadeMs = FADE_OUT_STALLED_MS)
             } else {
-                handler.postDelayed(this, 100)
+                handler.postDelayed(this, if (timeout == Long.MAX_VALUE) 500 else 100)
             }
         }
     }
+
+    /**
+     * A tracked fold that stops partway keeps its frost as long as the user
+     * chose (by default, for as long as it's held). Without tracking the
+     * angle is only a guess, so a parked hinge clears soon.
+     */
+    private fun settleTimeoutMs(): Long {
+        if (!hinge.externalFeedRunning) return SETTLE_TIMEOUT_MS
+        val hold = DuoSettings.config.value.holdFrostS
+        return if (hold <= 0) Long.MAX_VALUE else hold * 1_000L
+    }
+
+    /** Hinge angle where a tracked fold stalled and the overlay was let go; NaN otherwise. */
+    private var stalledAt = Float.NaN
 
     /** A timed frost-up that no panel swap has replaced: the fold stalled, let the live screen through. */
     private val peakHold = Runnable {
@@ -114,6 +142,8 @@ class PanelEngine(
         val tilt = currentTilt()
         panelSwitched = tilt >= DuoShader.FLAT_EPSILON
         restArmed = !panelSwitched
+        if (panelSwitched && innerPanel) innerFullAt = hinge.lastAngle
+        if (panelSwitched && !innerPanel) coverFullAt = hinge.lastAngle
         Log.i(TAG, "engine display=$displayId inner=$innerPanel midFold=$panelSwitched")
     }
 
@@ -124,9 +154,9 @@ class PanelEngine(
         if (angle.isNaN()) return 0f
         val config = DuoSettings.config.value
         return when {
-            innerPanel -> DuoShader.tiltForHinge(angle, config)
+            innerPanel -> DuoShader.tiltForHinge(angle, config, innerFullAt)
             concurrentCover() -> DuoShader.concurrentCoverTiltForHinge(angle, config)
-            else -> DuoShader.coverTiltForHinge(angle, config)
+            else -> DuoShader.coverTiltForHinge(angle, config, coverFullAt.takeIf { it.isFinite() } ?: hinge.panelSwapHinge)
         }
     }
 
@@ -135,7 +165,19 @@ class PanelEngine(
     fun onHinge(angle: Float) {
         lastHingeMoveMs = SystemClock.uptimeMillis()
         evaluate()
+        dimFollower?.follow { now -> hinge.estimate(now) }
         val tilt = tiltFor(angle)
+        if (timedResolve && hinge.externalActive && phase == Phase.SHOWING && !demoRunning &&
+            (innerPanel || concurrentCover())
+        ) {
+            // A continuous angle (Shizuku) arrived mid-ease: follow the hand from here.
+            Log.i(TAG, "display $displayId: continuous angle $angle mid-ease; following")
+            timedResolve = false
+            handler.removeCallbacks(peakHold)
+            handler.removeCallbacks(settleCheck)
+            handler.postDelayed(settleCheck, SETTLE_TIMEOUT_MS)
+            follower?.tauS = TiltFollower.DEFAULT_TAU_S
+        }
         if (tilt < DuoShader.FLAT_EPSILON && phase == Phase.SHOWING && !demoRunning) {
             val f = follower
             if (timedResolve && hinge.isCoarse && f != null && f.current > DuoShader.FLAT_EPSILON) {
@@ -145,12 +187,25 @@ class PanelEngine(
                 handler.removeCallbacks(peakHold)
                 f.tauS = COARSE_CLEAR_TAU_S
                 f.setTarget(0f)
+            } else if (hinge.externalActive && !timedResolve && f != null && f.current > DuoShader.FLAT_EPSILON) {
+                // Continuous angle: a quick final push can jump 25° in one
+                // reading; let the frost clear rather than cut it. The
+                // follower dismisses at flat.
+                f.setTarget(0f)
             } else {
                 // At rest: drop the overlay now rather than easing the last degrees.
                 dismiss(fadeMs = FADE_OUT_FLAT_MS)
             }
         } else if (!timedResolve) {
-            follower?.setTarget(tilt)
+            val f = follower
+            if (f != null && hinge.externalActive) {
+                // Samsung's readings are ~5° apart: follow the tracked hinge
+                // every frame instead of stepping to each reading.
+                f.tauS = TiltFollower.FOLLOW_TAU_S
+                f.follow { now -> tiltFor(hinge.estimate(now)) }
+            } else {
+                f?.setTarget(tilt)
+            }
         }
     }
 
@@ -167,14 +222,15 @@ class PanelEngine(
         if (inner != innerPanel) {
             innerPanel = inner
             panelSwitched = true
-            if (phase != Phase.IDLE) removeOverlay() // old panel's snapshot is meaningless now
+            innerFullAt = if (inner) hinge.lastAngle.takeIf { it.isFinite() } ?: DuoShader.PANEL_ON_HINGE else restInnerFullAt()
+            coverFullAt = if (inner) Float.NaN else hinge.lastAngle
+            if (phase != Phase.IDLE) removeOverlay(retire = true) // old panel's snapshot is meaningless now
         }
         val angle = hinge.lastAngle
         if (angle.isNaN()) return
         val tilt = tiltFor(angle)
         if (tilt < DuoShader.FLAT_EPSILON) {
-            restArmed = true
-            panelSwitched = false
+            armRest()
             return
         }
         if (phase != Phase.IDLE) return
@@ -182,9 +238,16 @@ class PanelEngine(
             panelSwitched -> {
                 panelSwitched = false
                 restArmed = false
+                stalledAt = Float.NaN
                 Log.i(TAG, "display $displayId: panel swapped (inner=$inner) at hinge=$angle")
                 // The fresh panel may still be lighting up: retry if black.
                 startEffect(afterSwap = true)
+            }
+            // Moving again after a stall: with a continuous angle the fold can pick up where it is.
+            stalledAt.isFinite() && hinge.externalActive && abs(angle - stalledAt) >= RESUME_AFTER_STALL_DEG -> {
+                stalledAt = Float.NaN
+                Log.i(TAG, "display $displayId: moving again after a stall at hinge=$angle")
+                startEffect(afterSwap = false)
             }
             restArmed && tilt >= REST_LEAVE_TILT -> {
                 restArmed = false
@@ -192,6 +255,21 @@ class PanelEngine(
                 startEffect(afterSwap = false)
             }
         }
+    }
+
+    /**
+     * At a rest pose (flat open, or shut on the cover): the next movement away
+     * starts the fold afresh. Called when a reading says so, and when the
+     * tracked hinge has carried the frost there — the last reading of an open
+     * or a close lands a few degrees short of the end, so the readings alone
+     * might never say it.
+     */
+    private fun armRest() {
+        restArmed = true
+        panelSwitched = false
+        innerFullAt = restInnerFullAt()
+        coverFullAt = Float.NaN
+        stalledAt = Float.NaN
     }
 
     /** Live blur needs no capture: the system blurs whatever is on screen. */
@@ -205,6 +283,20 @@ class PanelEngine(
             present(bitmap = null, afterSwap = afterSwap, startTilt = startTilt, t0 = SystemClock.uptimeMillis())
             return
         }
+        // Shizuku: a panel that has just switched on gets the overlay at once,
+        // in black — what the panel shows anyway while it wakes and apps
+        // relaunch or resize on it — and the refresh loop fades it up into the
+        // picture once the panel has settled (see [startRefreshLoop]).
+        if (afterSwap && startTilt == null && shellCapture()) {
+            phase = Phase.CAPTURING
+            val bounds = windowManager.maximumWindowMetrics.bounds
+            val placeholder = cache.get(innerPanel, bounds.width(), bounds.height()) ?: BLACK_PLACEHOLDER
+            presentingBridge = true
+            present(placeholder, afterSwap = true, startTilt = null, t0 = SystemClock.uptimeMillis())
+            presentingBridge = false
+            bridging = phase == Phase.SHOWING
+            return
+        }
         // A panel that has just switched on takes ~0.3 s to screenshot. Start
         // at once with the picture it showed last time and swap in the fresh
         // capture when it lands — the frost hides the difference.
@@ -214,7 +306,9 @@ class PanelEngine(
             if (stale != null) {
                 phase = Phase.CAPTURING
                 Log.i(TAG, "display $displayId: bridging with a ${cache.ageMs(innerPanel)}ms-old snapshot")
+                presentingBridge = true
                 present(stale, afterSwap = true, startTilt = null, t0 = SystemClock.uptimeMillis())
+                presentingBridge = false
                 bridging = phase == Phase.SHOWING
             }
         }
@@ -357,7 +451,7 @@ class PanelEngine(
             val s = surface as? SnapshotSurface
             if (s != null && phase == Phase.SHOWING) {
                 Log.i(TAG, "display $displayId: fresh capture (${SystemClock.uptimeMillis() - t0}ms) replaces the bridge at tilt=${s.tilt}")
-                s.replaceSnapshot(bitmap)
+                s.replaceSnapshot(bitmap, crossfadeMs = FRESH_FADE_MS)
             }
             return
         }
@@ -380,7 +474,11 @@ class PanelEngine(
         // motion, so: frost in on leaving rest and hold; on the fresh panel
         // start frosted and hold; clear only when the rest stop arrives (see
         // onHinge) or the hold cap expires.
-        val tilt = startTilt ?: if (coarse) (if (afterSwap) peak else DuoShader.FLAT_EPSILON * 1.2f) else currentTilt()
+        val tilt = when {
+            startTilt != null -> startTilt
+            coarse -> if (afterSwap) peak else DuoShader.FLAT_EPSILON * 1.2f
+            else -> currentTilt()
+        }
         // A capture lands late; the live blur is instant, so it's never "too late".
         val nearlyDone = bitmap != null && afterSwap && live &&
             if (innerPanel) angle > SKIP_INNER_ABOVE_HINGE else angle < SKIP_COVER_BELOW_HINGE
@@ -397,12 +495,13 @@ class PanelEngine(
         // A cover lit alongside the inner panel keeps hearing the hinge.
         val easeTo = when {
             coarse -> peak
-            afterSwap && !innerPanel && !concurrentCover() && live -> 0f
+            // (With a continuous angle — the cover lit early — follow the hinge instead.)
+            afterSwap && !innerPanel && !concurrentCover() && live && !hinge.externalActive -> 0f
             else -> null
         }
         val how = if (bitmap != null) "${bitmap.width}x${bitmap.height} snapshot (capture ${SystemClock.uptimeMillis() - t0}ms)" else "live blur"
         Log.i(TAG, "display $displayId: showing $how at tilt=$tilt${easeTo?.let { " easing to $it" } ?: ""}${if (bitmap != null && shellCapture()) " [shizuku]" else ""}")
-        show(bitmap, tilt, fadeIn = afterSwap, easeTo = easeTo)
+        show(bitmap, tilt, afterSwap = afterSwap, easeTo = easeTo)
     }
 
     /** Samples a coarse grid; true when nothing on screen is brighter than near-black. */
@@ -431,7 +530,7 @@ class PanelEngine(
      * until it's back at rest; easing up to a frosted peak holds there
      * briefly, then fades unless a panel swap has replaced it.
      */
-    private fun show(bitmap: Bitmap?, startTilt: Float, fadeIn: Boolean = false, easeTo: Float? = null) {
+    private fun show(bitmap: Bitmap?, startTilt: Float, afterSwap: Boolean = false, easeTo: Float? = null) {
         val inner = innerPanel
         val config = DuoSettings.config.value
         val foldLine = { w: Float, h: Float, c: com.duoopen.settings.DuoConfig -> DuoShader.foldFor(inner, w, h, c) }
@@ -448,21 +547,39 @@ class PanelEngine(
         }
         created.tilt = startTilt
         surface = created
-        if (bitmap != null && shellCapture()) startLiveLoop()
         phase = Phase.SHOWING
         onShowingChanged()
-        if (fadeIn) {
-            // Content was already live on this panel; ease the frost in.
+        if (afterSwap && presentingBridge && shellCapture()) {
+            (created as? SnapshotSurface)?.veil()
+        } else if (afterSwap && !presentingBridge) {
+            // Content was already live on this panel; ease the frost in. (A
+            // bridge goes up at once: what's beneath is still waking up.)
             created.fadeIn(FADE_IN_MS)
+        }
+        // On a panel that just lit up, first wait for it to settle.
+        if (bitmap != null && shellCapture()) startRefreshLoop(settling = afterSwap, shown = bitmap)
+        // Heading for a hand-over this panel won't survive: dim it out on the way.
+        if (!afterSwap && !demoRunning && hinge.externalActive && created is SnapshotSurface) {
+            dimFollower = TiltFollower { a -> created.setHandoverDim(handoverDim(a)) }
+                .also { it.snap(hinge.estimate()) }
         }
         follower = TiltFollower { t ->
             created.tilt = t
-            if (t < DuoShader.FLAT_EPSILON && !demoRunning) dismiss(fadeMs = FADE_OUT_FLAT_MS)
+            if (t < DuoShader.FLAT_EPSILON && !demoRunning) {
+                dismiss(fadeMs = FADE_OUT_FLAT_MS)
+                armRest()
+            }
         }.also { it.snap(startTilt) }
         lastHingeMoveMs = SystemClock.uptimeMillis()
         timedResolve = easeTo != null
         if (easeTo != null) {
-            follower?.tauS = if (hinge.isCoarse) COARSE_EASE_TAU_S else TIMED_RESOLVE_TAU_S
+            follower?.tauS = when {
+                // Opening from shut: nothing reports the angle until the panels
+                // swap (~1–1.5 s on a Z Fold 8 Ultra), so spread the frost over that.
+                !inner && easeTo > DuoShader.FLAT_EPSILON && hinge.posture == HingeAngleSource.Posture.TENT -> COVER_OPEN_TAU_S
+                hinge.isCoarse -> COARSE_EASE_TAU_S
+                else -> TIMED_RESOLVE_TAU_S
+            }
             follower?.setTarget(easeTo)
             if (easeTo > DuoShader.FLAT_EPSILON) {
                 handler.postDelayed(peakHold, if (hinge.isCoarse) COARSE_PEAK_HOLD_MS else PEAK_HOLD_MS)
@@ -472,6 +589,22 @@ class PanelEngine(
         }
     }
 
+    /**
+     * How dark this panel should be at [angle]: black by [DIM_GAP] degrees short
+     * of where it hands over (the cover on an open: ~85°; the inner panel on a
+     * close: the early cover takeover, else shut), ramping in over [DIM_SPAN]
+     * before that, so the panel switching off is a fade rather than a cut.
+     */
+    private fun handoverDim(angle: Float): Float {
+        val distance = if (innerPanel) {
+            angle - (hinge.coverTakeoverHinge.takeIf { it.isFinite() } ?: SHUT_HANDOVER_HINGE)
+        } else {
+            hinge.panelSwapHinge - angle
+        }
+        val t = (1f - (distance - DIM_GAP) / DIM_SPAN).coerceIn(0f, 1f)
+        return t * t * (3f - 2f * t)
+    }
+
     private fun dismiss(fadeMs: Long) {
         val s = surface ?: return
         Log.i(TAG, "display $displayId: dismiss (fade ${fadeMs}ms) at tilt=${s.tilt}")
@@ -479,40 +612,129 @@ class PanelEngine(
         s.fadeOut(fadeMs) { s.detach() }
     }
 
-    private fun removeOverlay() {
+    /** @param retire the panel is handing over: leave the window up in black for a moment (see [SnapshotSurface.retire]). */
+    private fun removeOverlay(retire: Boolean = false) {
         phase = Phase.IDLE
         timedResolve = false
         val s = surface ?: return
         clearOverlayState()
-        s.detach()
+        if (retire && s is SnapshotSurface) s.retire(handler, RETIRE_MS) else s.detach()
     }
 
+    private class Shot(val bitmap: Bitmap, val signature: IntArray, val pyramid: FoldOverlayView.Pyramid?)
+
     /**
-     * Shizuku mode: keep re-capturing the screen beneath the overlay at a
-     * reduced scale, so the picture under the frost is live instead of frozen.
+     * Shizuku mode: keeps the picture under the frost current without ever
+     * cutting to a new one.
+     *
+     * Settling (a panel that has just lit up, behind the black veil): fades
+     * up from black at once into [shown] — the panel's last picture — or, with
+     * none, into the first capture that isn't dark. It keeps capturing every
+     * [SETTLE_INTERVAL_MS] until two in a row match (the system's transition
+     * over, apps done relaunching or resizing for the new screen) or
+     * [SETTLE_MAX_MS] pass, and only if that settled screen differs from what
+     * is showing is it blended in.
+     * After that, live: every [LIVE_INTERVAL_MS], a new capture is faded in
+     * only if the screen clearly changed, so a still screen costs nothing.
      */
-    private fun startLiveLoop() {
+    private fun startRefreshLoop(settling: Boolean, shown: Bitmap) {
         if (liveLoop) return
         liveLoop = true
         val myGen = captureGen
-        var frames = 0
+        val started = SystemClock.uptimeMillis()
+        var settle = settling
+        // What's on screen now, and (settling) the previous capture.
+        var shownSignature = shown.takeIf { it !== BLACK_PLACEHOLDER && it.config != Bitmap.Config.HARDWARE }?.let(::signature)
+        var lastSignature: IntArray? = null
+        var unveiled = !settling
+        if (settling && shownSignature != null) {
+            (surface as? SnapshotSurface)?.unveil(WAKE_FADE_MS)
+            unveiled = true
+        }
+        var fades = 0
+        // A fold held still: what's under the frost changes less often, look less often.
+        fun interval() = when {
+            settle -> SETTLE_INTERVAL_MS
+            SystemClock.uptimeMillis() - lastHingeMoveMs > STILL_AFTER_MS -> LIVE_IDLE_INTERVAL_MS
+            else -> LIVE_INTERVAL_MS
+        }
         fun tick() {
             if (!liveLoop || phase != Phase.SHOWING || myGen != captureGen) { liveLoop = false; return }
             val s = surface as? SnapshotSurface
-            if (s == null || s.tilt < DuoShader.FLAT_EPSILON) { handler.postDelayed({ tick() }, LIVE_INTERVAL_MS); return }
+            if (settle && s != null && SystemClock.uptimeMillis() - started >= SETTLE_GIVE_UP_MS) {
+                // Nothing usable came (the panel stayed dark?): show what there is.
+                Log.i(TAG, "display $displayId: nothing settled")
+                if (!unveiled) s.unveil(WAKE_FADE_MS)
+                unveiled = true
+                bridging = false
+                settle = false
+            }
             val excluded = excludedLayers()
-            if (excluded.isEmpty()) { handler.postDelayed({ tick() }, LIVE_INTERVAL_MS); return }
+            if (s == null || s.tilt < DuoShader.FLAT_EPSILON || excluded.isEmpty()) {
+                handler.postDelayed({ tick() }, interval())
+                return
+            }
+            val pw = s.view.pyramidWidth
+            val ph = s.view.pyramidHeight
+            val scale = if (settle) SETTLE_SHELL_SCALE else LIVE_SHELL_SCALE
             scope.launch {
-                val frame = withContext(Dispatchers.IO) { ShizukuBridge.capture(displayId, excluded, LIVE_SHELL_SCALE) }
-                if (liveLoop && phase == Phase.SHOWING && myGen == captureGen && frame != null && !bridging) {
-                    (surface as? SnapshotSurface)?.replaceSnapshot(frame)
-                    frames++
-                    if (frames == 1 || frames % 25 == 0) Log.i(TAG, "display $displayId: live frame $frames (${frame.width}x${frame.height})")
+                val shot = withContext(Dispatchers.IO) {
+                    ShizukuBridge.capture(displayId, excluded, scale)?.let { f ->
+                        Shot(f, signature(f), FoldOverlayView.Pyramid.build(f, pw, ph))
+                    }
                 }
-                handler.postDelayed({ tick() }, LIVE_INTERVAL_MS)
+                if (!liveLoop || phase != Phase.SHOWING || myGen != captureGen) return@launch
+                val target = surface as? SnapshotSurface
+                val waited = SystemClock.uptimeMillis() - started
+                if (shot != null && target != null && shot.signature.max() >= BLACK_SIGNATURE) {
+                    val showing = shownSignature
+                    if (settle && !unveiled) {
+                        // No earlier picture of this panel: the first real one, up from black.
+                        Log.i(TAG, "display $displayId: first picture after ${waited}ms; fading up at tilt=${target.tilt}")
+                        target.replaceSnapshot(shot.bitmap, shot.pyramid)
+                        target.unveil(WAKE_FADE_MS)
+                        unveiled = true
+                        shownSignature = shot.signature
+                    } else if (settle) {
+                        val prev = lastSignature
+                        if ((prev != null && difference(prev, shot.signature) < SETTLE_DIFF) || waited >= SETTLE_MAX_MS) {
+                            val changed = showing == null || difference(showing, shot.signature) >= SETTLE_DIFF
+                            Log.i(TAG, "display $displayId: settled after ${waited}ms${if (changed) "; blending it in" else ""}")
+                            if (changed) {
+                                target.replaceSnapshot(shot.bitmap, shot.pyramid, SETTLED_FADE_MS)
+                                shownSignature = shot.signature
+                            }
+                            cache.put(innerPanel, shot.bitmap)
+                            bridging = false
+                            settle = false
+                        }
+                    } else if (showing == null || difference(showing, shot.signature) >= LIVE_CHANGE_DIFF) {
+                        target.replaceSnapshot(shot.bitmap, shot.pyramid, LIVE_FADE_MS)
+                        shownSignature = shot.signature
+                        if (++fades % 25 == 1) Log.i(TAG, "display $displayId: live change $fades (${shot.bitmap.width}x${shot.bitmap.height})")
+                    }
+                    lastSignature = shot.signature
+                }
+                handler.postDelayed({ tick() }, interval())
             }
         }
-        handler.postDelayed({ tick() }, LIVE_INTERVAL_MS)
+        handler.postDelayed({ tick() }, interval())
+    }
+
+    /** Luma on a coarse grid; resolution-independent, for comparing captures. */
+    private fun signature(b: Bitmap): IntArray {
+        val n = SIGNATURE_GRID
+        return IntArray(n * n) { i ->
+            val c = b.getPixel(((i % n + 0.5f) * b.width / n).toInt(), ((i / n + 0.5f) * b.height / n).toInt())
+            (((c shr 16) and 0xFF) * 3 + ((c shr 8) and 0xFF) * 6 + (c and 0xFF)) / 10
+        }
+    }
+
+    /** Mean absolute luma difference, 0–255. */
+    private fun difference(a: IntArray, b: IntArray): Float {
+        var sum = 0L
+        for (i in a.indices) sum += abs(a[i] - b[i])
+        return sum.toFloat() / a.size
     }
 
     private fun clearOverlayState() {
@@ -521,6 +743,8 @@ class PanelEngine(
         handler.removeCallbacks(peakHold)
         follower?.cancel()
         follower = null
+        dimFollower?.cancel()
+        dimFollower = null
         surface = null
         timedResolve = false
         bridging = false
@@ -529,9 +753,10 @@ class PanelEngine(
     }
 
     /** The display went away or the service is stopping. */
-    fun destroy() {
+    /** @param handover the display went dark for a panel swap, not for good: see [removeOverlay]. */
+    fun destroy(handover: Boolean = false) {
         captureGen++ // orphan any capture in flight
-        removeOverlay()
+        removeOverlay(retire = handover)
         Log.i(TAG, "engine display=$displayId destroyed")
     }
 
@@ -597,13 +822,52 @@ class PanelEngine(
         const val SKIP_INNER_ABOVE_HINGE = 135f
         const val SKIP_COVER_BELOW_HINGE = 10f
         const val SETTLE_TIMEOUT_MS = 700L
+        const val RESUME_AFTER_STALL_DEG = 4f
+        /** Cover frost-in from TENT, ≈ 1 s to full — about how long until the inner panel takes over. */
+        const val COVER_OPEN_TAU_S = 0.33f
         const val FADE_IN_MS = 140L
         const val FADE_OUT_FLAT_MS = 120L
         const val FADE_OUT_STALLED_MS = 300L
-        /** Shizuku capture: full-size first frame, half-size live frames at ~12 fps. */
-        const val INITIAL_SHELL_SCALE = 1f
-        const val LIVE_SHELL_SCALE = 0.5f
-        const val LIVE_INTERVAL_MS = 80L
+        /**
+         * Shizuku capture scales. Half size is already finer than the fold
+         * view renders, and at a light frost the overlay hands over to the real
+         * screen, so a full-size picture is never on show. Live frames are
+         * smaller still: each is a texture upload, which costs the frame it
+         * lands in more than the shader does.
+         */
+        const val INITIAL_SHELL_SCALE = 0.5f
+        const val SETTLE_SHELL_SCALE = 0.5f
+        const val LIVE_SHELL_SCALE = 1f / 3f
+        /** A lit-up panel is re-captured this often until two captures match… */
+        const val SETTLE_INTERVAL_MS = 100L
+        /** …or this long has passed. */
+        const val SETTLE_MAX_MS = 1_200L
+        /** No usable capture at all by now: lift the black anyway. */
+        const val SETTLE_GIVE_UP_MS = 1_600L
+        /** Fade up from black as a panel lights up — about as long as it takes to settle. */
+        const val WAKE_FADE_MS = 380L
+        /** Blend for a settled screen that turned out different (an app relaunched). */
+        const val SETTLED_FADE_MS = 160L
+        /** Hand-over dim: black this many degrees short of the hand-over, ramping in over the span before. */
+        const val DIM_GAP = 2f
+        const val DIM_SPAN = 14f
+        /** How long a handed-over panel's overlay stays up in black, under the new one. */
+        const val RETIRE_MS = 400L
+        /** Without an early cover takeover the inner panel hands over as the phone shuts. */
+        const val SHUT_HANDOVER_HINGE = 2f
+        /** Mean luma difference (0–255) below which two captures count as the same screen. */
+        const val SETTLE_DIFF = 2f
+        /** Live refresh: how often to look, and how much must change to fade a new picture in. */
+        const val LIVE_INTERVAL_MS = 200L
+        const val LIVE_IDLE_INTERVAL_MS = 1_000L
+        const val STILL_AFTER_MS = 2_000L
+        const val LIVE_CHANGE_DIFF = 6f
+        /** Accessibility path: a fresh capture replacing the bridge. */
+        const val FRESH_FADE_MS = 260L
+        const val LIVE_FADE_MS = 120L
+        const val SIGNATURE_GRID = 16
+        /** A capture whose brightest grid sample is below this is a panel still dark. */
+        const val BLACK_SIGNATURE = 12
         const val SHELL_RETRY_MS = 60L
 
         /**
@@ -611,6 +875,9 @@ class PanelEngine(
          * needed to exclude our overlay from a display capture. Null if the
          * hidden-API exemption isn't in place.
          */
+        /** Stands in under the black veil when a panel lights up with no earlier picture of it. */
+        val BLACK_PLACEHOLDER: Bitmap = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888).apply { eraseColor(android.graphics.Color.BLACK) }
+
         fun rootSurfaceControl(view: View): SurfaceControl? = runCatching {
             val root = view.rootView.parent ?: return null
             val sc = root.javaClass.getMethod("getSurfaceControl").invoke(root) as? SurfaceControl

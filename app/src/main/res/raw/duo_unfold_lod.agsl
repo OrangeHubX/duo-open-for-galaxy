@@ -1,0 +1,153 @@
+// Duo-Unfold, mip-pyramid variant — same glass geometry as duo_unfold.agsl,
+// for the system-wide overlay, which has the picture as a bitmap and can hand
+// the shader pre-shrunk copies of it.
+//
+// Instead of up to 32 scattered taps on the full-resolution picture, each
+// pixel takes 8 taps from the pyramid level where the blur radius spans
+// about TEXELS texels, blended with the next level up so the blur grows
+// without seams. Taps that close together on a small texture are cheap and
+// cache-friendly, and the result is a smooth glassy blur rather than grain,
+// so the overlay can afford to render at a finer resolution.
+//
+// A second picture can be cross-faded in: with prevWeight > 0 the same taps
+// also read the previous picture (prev, prevLod1..5) and the two are mixed,
+// so a fresh capture never cuts in. Costs double while it lasts.
+//
+// Children: content = the full picture; lod1..lod5 = the same picture at
+// 1/2 .. 1/32 of this shader's resolution, all mapped onto its coordinates
+// with linear filtering; prev* = the same for the outgoing picture.
+//
+// NOTE: minimal AGSL constructs, as in duo_unfold.agsl (no break/continue, no
+// helper functions); level selection is an if-chain inside the tap loop.
+
+uniform shader content;
+uniform shader lod1;
+uniform shader lod2;
+uniform shader lod3;
+uniform shader lod4;
+uniform shader lod5;
+uniform shader prev;
+uniform shader prevLod1;
+uniform shader prevLod2;
+uniform shader prevLod3;
+uniform shader prevLod4;
+uniform shader prevLod5;
+uniform float prevWeight;  // 0 = only the current picture, 1 = only the previous one
+uniform float2 resolution;
+uniform float tiltDegrees;
+uniform float eyeDistancePx;
+uniform float hingePos;
+uniform float eyeX;
+uniform float axisSwap;
+uniform float paneSide;
+uniform float blurSpread;
+uniform float darkening;
+
+const float GOLDEN_ANGLE = 2.39996322972865332;
+const float TWO_PI = 6.28318530717958648;
+// Blur radius, in texels of the chosen level.
+const float TEXELS = 2.0;
+const int TAPS = 8;
+const float TAPS_F = 8.0;
+
+half4 main(float2 fragCoord) {
+    half pw = half(clamp(prevWeight, 0.0, 1.0));
+    if (resolution.x <= 1.0 || resolution.y <= 1.0) {
+        return content.eval(fragCoord);
+    }
+    float tilt = radians(clamp(tiltDegrees, 0.0, 60.0));
+    if (tilt < 1e-4) {
+        return half4(mix(content.eval(fragCoord).rgb, prev.eval(fragCoord).rgb, pw), 1.0);
+    }
+
+    // Work in a frame where the hinge is always a vertical line at x = hingePos.
+    float2 p = mix(fragCoord, fragCoord.yx, axisSwap);
+    float2 size = mix(resolution, resolution.yx, axisSwap);
+
+    float side = mix(-1.0, 1.0, step(hingePos, p.x));
+    if (paneSide * side < -0.5) {
+        return half4(mix(content.eval(fragCoord).rgb, prev.eval(fragCoord).rgb, pw), 1.0);
+    }
+    float d = abs(p.x - hingePos);
+
+    float2 glass = float2(hingePos + side * d * cos(tilt), p.y);
+    float gap = d * sin(tilt);
+    float2 eye = float2(eyeX, size.y * 0.5);
+
+    float depth = eyeDistancePx - gap;
+    if (depth <= 1e-3) {
+        return half4(0.0, 0.0, 0.0, 1.0);
+    }
+    float2 hitS = eye + (glass - eye) * (eyeDistancePx / depth);
+
+    float radius = blurSpread * gap;
+
+    if (hitS.x < -radius || hitS.y < -radius ||
+        hitS.x > size.x + radius || hitS.y > size.y + radius) {
+        return half4(0.0, 0.0, 0.0, 1.0);
+    }
+
+    float2 hit = mix(hitS, hitS.yx, axisSwap);
+    float atten = max(1.0 - darkening * radius, 0.0);
+
+    if (radius < 0.5) {
+        return half4(mix(content.eval(hit).rgb, prev.eval(hit).rgb, pw) * half(atten), 1.0);
+    }
+
+    // Level whose texels (2^level px here) make the radius about TEXELS wide;
+    // level 0 is the full picture. Blend `f` of the way to the next level.
+    float level = clamp(log2(radius / TEXELS), 0.0, 4.999);
+    float l0 = floor(level);
+    half f = half(level - l0);
+
+    // Per-pixel rotation of the disk hides its pattern; on texels this size
+    // it reads as smooth, not grainy.
+    float rotation = fract(52.9829189 * fract(dot(fragCoord, float2(0.06711056, 0.00583715)))) * TWO_PI;
+    half3 sum = half3(0.0);
+    half3 sumPrev = half3(0.0);
+    for (int i = 0; i < TAPS; i++) {
+        float fi = float(i);
+        float r = radius * sqrt((fi + 0.5) / TAPS_F);
+        float a = fi * GOLDEN_ANGLE + rotation;
+        float2 q = hit + r * float2(cos(a), sin(a));
+        half3 lo;
+        half3 hi;
+        if (l0 < 0.5) {
+            lo = content.eval(q).rgb;
+            hi = lod1.eval(q).rgb;
+        } else if (l0 < 1.5) {
+            lo = lod1.eval(q).rgb;
+            hi = lod2.eval(q).rgb;
+        } else if (l0 < 2.5) {
+            lo = lod2.eval(q).rgb;
+            hi = lod3.eval(q).rgb;
+        } else if (l0 < 3.5) {
+            lo = lod3.eval(q).rgb;
+            hi = lod4.eval(q).rgb;
+        } else {
+            lo = lod4.eval(q).rgb;
+            hi = lod5.eval(q).rgb;
+        }
+        sum += mix(lo, hi, f);
+        if (pw > 0.0) {
+            if (l0 < 0.5) {
+                lo = prev.eval(q).rgb;
+                hi = prevLod1.eval(q).rgb;
+            } else if (l0 < 1.5) {
+                lo = prevLod1.eval(q).rgb;
+                hi = prevLod2.eval(q).rgb;
+            } else if (l0 < 2.5) {
+                lo = prevLod2.eval(q).rgb;
+                hi = prevLod3.eval(q).rgb;
+            } else if (l0 < 3.5) {
+                lo = prevLod3.eval(q).rgb;
+                hi = prevLod4.eval(q).rgb;
+            } else {
+                lo = prevLod4.eval(q).rgb;
+                hi = prevLod5.eval(q).rgb;
+            }
+            sumPrev += mix(lo, hi, f);
+        }
+    }
+    return half4(mix(sum, sumPrev, pw) / half(TAPS_F) * half(atten), 1.0);
+}

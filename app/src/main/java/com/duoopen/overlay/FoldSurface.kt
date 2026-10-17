@@ -69,7 +69,8 @@ class SnapshotSurface(
                 overlayParams(
                     WindowManager.LayoutParams.MATCH_PARENT,
                     WindowManager.LayoutParams.MATCH_PARENT,
-                    PixelFormat.OPAQUE,
+                    // Translucent: fades and the light-frost hand-off show the live screen, not black.
+                    PixelFormat.TRANSLUCENT,
                 ),
             )
         }.onFailure { Log.e(TAG, "addView failed", it) }.isSuccess
@@ -81,8 +82,29 @@ class SnapshotSurface(
             view.tilt = value
         }
 
-    /** Swap a stale bridging picture for the fresh capture, keeping the current tilt. */
-    fun replaceSnapshot(bitmap: Bitmap) = view.setSnapshot(bitmap)
+    /**
+     * Swap a stale bridging picture for the fresh capture, keeping the current
+     * tilt and cross-fading over [crossfadeMs]. Pass a
+     * [FoldOverlayView.Pyramid] built off the main thread to skip building it here.
+     */
+    fun replaceSnapshot(bitmap: Bitmap, pyramid: FoldOverlayView.Pyramid? = null, crossfadeMs: Long = 0L) =
+        view.setSnapshot(bitmap, pyramid, crossfadeMs)
+
+    /** Black until [unveil]: see [FoldOverlayView.veil]. */
+    fun veil() = view.veil()
+    fun unveil(durationMs: Long) = view.unveil(durationMs)
+    fun setHandoverDim(amount: Float) = view.setHandoverDim(amount)
+
+    /**
+     * The panel under this overlay is handing over to the other one. Logical
+     * display 0 moves to the new panel with this window on it, so instead of
+     * leaving it to show the new panel raw until its own overlay is up, turn
+     * it black and remove it [afterMs] later, under the new overlay.
+     */
+    fun retire(handler: android.os.Handler, afterMs: Long) {
+        view.retire()
+        handler.postDelayed({ detach() }, afterMs)
+    }
 
     override fun fadeIn(durationMs: Long) {
         view.alpha = 0f

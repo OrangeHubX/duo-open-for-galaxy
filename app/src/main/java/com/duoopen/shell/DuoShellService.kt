@@ -27,15 +27,13 @@ import java.util.regex.Pattern
  * 1. **Display capture without the accessibility rate limit**, through the
  *    hidden `IWindowManager.captureDisplay`, with our own overlay layers
  *    excluded — so the fold can re-capture the live screen while it plays.
- * 2. **Samsung's continuous hinge angle.** Only Samsung's own components get
- *    the real angle; its "Fold interactive" home wallpaper logs it on every
- *    wallpaper command it receives (`mCurrentAngle=…`), and the shell user may
- *    read logcat. The app pings the wallpaper; this tails the log and calls
- *    back with each fresh value.
+ * 2. **Samsung's hinge angle.** Only Samsung's own components may read the
+ *    hinge sensors, but the shell user may read logcat, and the sensor HAL
+ *    logs every 10–11° step of its two hinge sensors with the time it was
+ *    sampled. This tails those lines and calls back with each reading.
  *
- * Both techniques were worked out by Duo Fold Live
- * (github.com/joeconsorti/duo-fold-live, MIT) — the capture-API resolution
- * and the wallpaper log format in particular follow their findings.
+ * The capture technique (and the idea of reading the hinge through logcat)
+ * was worked out by Duo Fold Live (github.com/joeconsorti/duo-fold-live, MIT).
  *
  * Nothing here is reachable without the user authorising this app in
  * Shizuku, and every transaction checks the calling uid.
@@ -57,6 +55,7 @@ class DuoShellService : Binder() {
         }
         if (code == SHIZUKU_DESTROY) {
             reader?.stop()
+            runCatching { baseState(-1) }
             System.exit(0)
             return true
         }
@@ -94,10 +93,9 @@ class DuoShellService : Binder() {
                 out.writeBundle(result)
             }
             ShellProtocol.START_ANGLES -> {
-                val action = data.readString() ?: throw IllegalArgumentException("action")
                 val callback = data.readStrongBinder() ?: throw IllegalArgumentException("callback")
                 reader?.stop()
-                reader = AngleReader(action, callback).also { it.start() }
+                reader = AngleReader(callback).also { it.start() }
                 out.writeNoException()
             }
             ShellProtocol.STOP_ANGLES -> {
@@ -109,9 +107,67 @@ class DuoShellService : Binder() {
                 out.writeNoException()
                 out.writeBundle(reader?.status() ?: Bundle().apply { putString("state", "not started") })
             }
+            ShellProtocol.BASE_STATE -> {
+                val state = data.readInt()
+                val identity = clearCallingIdentity()
+                val result = try {
+                    baseState(state)
+                } catch (t: Throwable) {
+                    var c: Throwable = t
+                    while (c.cause != null) c = c.cause!!
+                    Bundle().apply { putString("error", "${c.javaClass.simpleName}: ${c.message}") }
+                } finally {
+                    restoreCallingIdentity(identity)
+                }
+                out.writeNoException()
+                out.writeBundle(result)
+            }
             else -> return super.onTransact(code, data, reply, flags)
         }
         return true
+    }
+
+    // ---- device state ------------------------------------------------------
+
+    /**
+     * Identifies our override to the system. Note: on a Z Fold 8 Ultra the
+     * override was measured to *outlive* this process, so the app side
+     * remembers one may be left and cancels it on reconnect.
+     */
+    private val overrideToken = Binder()
+
+    /**
+     * Reports [state] to the system as the phone's physical posture (what
+     * `cmd device_state base-state` does), or with -1 hands back to the real
+     * one. Lets the app switch to the cover screen partway through a close.
+     */
+    private fun baseState(state: Int): Bundle {
+        // Deliberately no `cmd device_state base-state` fallback: a failure here
+        // must stay a failure, so the app never believes an override is in
+        // place (or gone) when it isn't.
+        val dsm = systemService("device_state", "android.hardware.devicestate.IDeviceStateManager\$Stub")
+        // The service only takes requests from processes it can call back.
+        if (!deviceStateCallbackRegistered) {
+            val cbType = Class.forName("android.hardware.devicestate.IDeviceStateManagerCallback")
+            val cb = Class.forName("android.hardware.devicestate.IDeviceStateManagerCallback\$Stub")
+                .getMethod("asInterface", IBinder::class.java).invoke(null, deviceStateCallback)
+            dsm.javaClass.getMethod("registerCallback", cbType).invoke(dsm, cb)
+            deviceStateCallbackRegistered = true
+        }
+        if (state < 0) {
+            dsm.javaClass.getMethod("cancelBaseStateOverride").invoke(dsm)
+        } else {
+            dsm.javaClass.getMethod("requestBaseStateOverride", IBinder::class.java, Integer.TYPE, Integer.TYPE)
+                .invoke(dsm, overrideToken, state, 0)
+        }
+        return Bundle().apply { putBoolean("ok", true) }
+    }
+
+    private var deviceStateCallbackRegistered = false
+
+    /** Receives the service's (one-way) state updates; nothing here needs them. */
+    private val deviceStateCallback = object : Binder() {
+        override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean = true
     }
 
     // ---- capture -----------------------------------------------------------
@@ -223,15 +279,10 @@ class DuoShellService : Binder() {
         }
     }
 
-    // ---- Samsung wallpaper angle reader -------------------------------------
+    // ---- Samsung hinge angle reader ------------------------------------------
 
-    /**
-     * Tails logcat for the "Fold interactive" wallpaper's command log. Each
-     * command the app sends makes the wallpaper log a line containing the
-     * action it was sent, whether it's visible, and `mCurrentAngle=<deg>`.
-     * Log format per Duo Fold Live's findings.
-     */
-    private class AngleReader(private val action: String, private val callback: IBinder) {
+    /** Tails logcat for the sensor HAL's hinge-sensor lines ([parse]). */
+    private class AngleReader(private val callback: IBinder) {
         @Volatile private var process: java.lang.Process? = null
         @Volatile private var stopped = false
         @Volatile private var state = "starting"
@@ -246,7 +297,7 @@ class DuoShellService : Binder() {
                 var child: java.lang.Process? = null
                 try {
                     child = ProcessBuilder(
-                        "logcat", "-v", "epoch", "-T", "1", "-s", "SprWallpaper|FoldInteractive:V", "*:S",
+                        "logcat", "-v", "epoch", "-T", "1", "-s", "sensors-hal:I", "*:S",
                     ).redirectErrorStream(true).start()
                     process = child
                     state = "listening"
@@ -264,13 +315,16 @@ class DuoShellService : Binder() {
                             }
                             parsed++
                             lastAngle = value
-                            lastUptime = SystemClock.uptimeMillis() - age.coerceAtLeast(0)
+                            // The HAL stamps each reading with when it was sampled.
+                            val sensorAge = if (halTs > 0) (SystemClock.elapsedRealtimeNanos() - halTs) / 1_000_000 else -1
+                            lastUptime = SystemClock.uptimeMillis() - (if (sensorAge in 0..1500) sensorAge else age.coerceAtLeast(0))
                             state = "receiving"
                             val p = Parcel.obtain()
                             try {
                                 p.writeInterfaceToken(ShellProtocol.CALLBACK_TOKEN)
                                 p.writeFloat(value)
                                 p.writeLong(lastUptime)
+                                p.writeInt(halSource)
                                 callback.transact(ShellProtocol.CB_ANGLE, p, null, IBinder.FLAG_ONEWAY)
                             } catch (e: Exception) {
                                 state = "callback gone: ${e.message}"
@@ -306,18 +360,40 @@ class DuoShellService : Binder() {
             putLong("last", lastUptime)
         }
 
+        /** Sensor timestamp (boot-time ns) of the line [parse] just accepted, or 0 if it had none. */
+        private var halTs = 0L
+        /** Which sensor logged that line (ShellProtocol.SOURCE_*). */
+        private var halSource = 0
+
+        /**
+         * Samsung's sensor HAL logs each step of its two hinge sensors
+         * (`folding_angle … value [ 89/0]` every 11°, `lid_angle_fusion … value
+         * [2/ 82/3]` every 10°), interleaved, over the whole range from shut
+         * to flat and whatever is on screen. Found on a Galaxy Z Fold 8 Ultra.
+         */
         private fun parse(line: String): Float? {
-            if (!line.contains("SprWallpaper|FoldInteractive") || !line.contains("onCommand:")) return null
-            if (!(line.contains("action=$action,") || line.contains("action[$action]"))) return null
-            if (!(line.contains("isVisible=true") || line.contains("isVisible[true]"))) return null
-            val m = ANGLE.matcher(line)
-            if (!m.find()) return null
-            val v = m.group(1)?.toFloatOrNull() ?: return null
-            return if (v in 0f..180f) v else null
+            halTs = 0L
+            // `[0]folding_angle device_mode(0 -> 1)`: the hall sensor, logged
+            // the moment the phone shuts (1) or opens (0), whatever the
+            // device state says meanwhile.
+            val mode = HAL_DEVICE_MODE.matcher(line)
+            if (mode.find()) {
+                halSource = if (mode.group(1) == "1") ShellProtocol.SOURCE_SHUT else ShellProtocol.SOURCE_UNSHUT
+                return 0f
+            }
+            val folding = HAL_FOLDING.matcher(line)
+            val m = if (folding.find()) folding else HAL_LID.matcher(line).takeIf { it.find() } ?: return null
+            val v = m.group(2)?.toFloatOrNull() ?: return null
+            if (v !in 0f..180f) return null
+            halTs = m.group(1)?.toLongOrNull() ?: 0L
+            halSource = if (m === folding) ShellProtocol.SOURCE_FOLDING else ShellProtocol.SOURCE_LID
+            return v
         }
 
         private companion object {
-            val ANGLE: Pattern = Pattern.compile("mCurrentAngle(?:=|\\[)([0-9]+(?:\\.[0-9]+)?)")
+            val HAL_DEVICE_MODE: Pattern = Pattern.compile("\\]folding_angle device_mode\\(\\d+ -> (\\d+)\\)")
+            val HAL_FOLDING: Pattern = Pattern.compile("\\]folding_angle ts=(\\d+) ns value \\[\\s*(\\d+)/")
+            val HAL_LID: Pattern = Pattern.compile("\\]lid_angle_fusion ts=(\\d+) ns value \\[\\d+/\\s*(\\d+)/")
         }
     }
 

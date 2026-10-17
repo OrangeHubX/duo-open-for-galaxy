@@ -2,6 +2,7 @@ package com.duoopen.overlay
 
 import android.graphics.Bitmap
 import android.os.SystemClock
+import kotlin.math.abs
 
 /**
  * The last screenshot taken of each panel kind, so a panel that has just
@@ -19,11 +20,12 @@ class SnapshotCache(private val maxAgeMs: Long) {
         entries[innerPanel] = Entry(bitmap, SystemClock.uptimeMillis())
     }
 
-    /** A recent, same-sized picture of this panel kind, or null. */
+    /** A recent picture of this panel kind in the same orientation (any resolution), or null. */
     fun get(innerPanel: Boolean, width: Int, height: Int): Bitmap? {
         val e = entries[innerPanel] ?: return null
         val b = e.bitmap
-        if (b.isRecycled || b.width != width || b.height != height) return null
+        val sameShape = abs(b.width.toLong() * height - b.height.toLong() * width) <= width.toLong() * height / 50
+        if (b.isRecycled || !sameShape) return null
         if (SystemClock.uptimeMillis() - e.at > maxAgeMs) return null
         return b
     }

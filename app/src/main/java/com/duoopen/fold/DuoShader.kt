@@ -18,7 +18,7 @@ data class FoldLine(
     val movingSide: Int? = null,
 )
 
-/** Shared glue for res/raw/duo_unfold.agsl — used by the app, wallpaper and overlay. */
+/** Shared glue for the fold shaders — used by the app preview and the overlay. */
 object DuoShader {
     /** Pane tilt cap; beyond this the kernel is mostly black anyway. */
     const val MAX_TILT = 45f
@@ -39,16 +39,27 @@ object DuoShader {
     /** A closed OnePlus Open idles anywhere from 0° to ~5°; below this the cover counts as at rest. */
     const val CLOSED_HINGE = 6f
 
+    /** Pyramid levels the lod shader samples beyond the full picture: 1/2 .. 1/32 of its resolution. */
+    const val LOD_LEVELS = 5
+
     private const val TAG = "DuoShader"
     private const val REFERENCE_PX_PER_MM = 6f
 
     @Volatile
     private var source: String? = null
+    @Volatile
+    private var lodSource: String? = null
 
-    fun create(context: Context): RuntimeShader? {
-        val src = source ?: context.resources.openRawResource(R.raw.duo_unfold)
+    /**
+     * @param lod The mip-pyramid variant (res/raw/duo_unfold_lod.agsl), which
+     *   also needs `lod1`..`lod5` children — see [LOD_LEVELS]. Only for callers
+     *   that hold the picture as a bitmap.
+     */
+    fun create(context: Context, lod: Boolean = false): RuntimeShader? {
+        val cached = if (lod) lodSource else source
+        val src = cached ?: context.resources.openRawResource(if (lod) R.raw.duo_unfold_lod else R.raw.duo_unfold)
             .bufferedReader().use { it.readText() }
-            .also { source = it }
+            .also { if (lod) lodSource = it else source = it }
         return try {
             RuntimeShader(src)
         } catch (e: Exception) {
@@ -63,19 +74,26 @@ object DuoShader {
      * — which freezes the picture for most of an unfold — the visible range
      * [PANEL_ON_HINGE]..[FLAT_HINGE] is mapped linearly onto 0..[MAX_TILT],
      * so the frost keeps resolving the whole way open. Intensity scales it.
+     *
+     * [fullAtHinge] moves the fully-frosted end: a panel that lit up later in
+     * the fold (the Z Fold 8 Ultra's inner screen comes on near 90°) starts
+     * fully frosted there instead of part-way cleared.
      */
-    fun tiltForHinge(hingeDegrees: Float, config: DuoConfig): Float {
-        val progress = ((FLAT_HINGE - hingeDegrees) / (FLAT_HINGE - PANEL_ON_HINGE)).coerceIn(0f, 1f)
+    fun tiltForHinge(hingeDegrees: Float, config: DuoConfig, fullAtHinge: Float = PANEL_ON_HINGE): Float {
+        val from = fullAtHinge.coerceIn(PANEL_ON_HINGE, FLAT_HINGE - 30f)
+        val progress = ((FLAT_HINGE - hingeDegrees) / (FLAT_HINGE - from)).coerceIn(0f, 1f)
         val full = if (config.movingSide == 0) MAX_TILT * 0.6f else MAX_TILT
         return (progress * full * config.intensity).coerceIn(0f, MAX_TILT)
     }
 
     /**
-     * Tilt on the cover panel, which is live only for the first/last
-     * [PANEL_ON_HINGE] degrees: flat when closed, fully frosted at the swap.
+     * Tilt on the cover panel, which is live only until the panels swap at
+     * [swapHinge] (OnePlus Open: [PANEL_ON_HINGE]; Z Fold 8 Ultra: ~85°):
+     * flat when closed, fully frosted at the swap.
      */
-    fun coverTiltForHinge(hingeDegrees: Float, config: DuoConfig): Float {
-        val progress = ((hingeDegrees - CLOSED_HINGE) / (PANEL_ON_HINGE - CLOSED_HINGE)).coerceIn(0f, 1f)
+    fun coverTiltForHinge(hingeDegrees: Float, config: DuoConfig, swapHinge: Float = PANEL_ON_HINGE): Float {
+        val to = swapHinge.coerceIn(PANEL_ON_HINGE, FLAT_HINGE - 30f)
+        val progress = ((hingeDegrees - CLOSED_HINGE) / (to - CLOSED_HINGE)).coerceIn(0f, 1f)
         return (progress * MAX_TILT * config.intensity).coerceIn(0f, MAX_TILT)
     }
 

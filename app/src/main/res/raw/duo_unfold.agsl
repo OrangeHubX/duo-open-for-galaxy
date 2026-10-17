@@ -89,19 +89,41 @@ half4 main(float2 fragCoord) {
     }
 
     // Vogel disk with per-pixel rotation (banding becomes frosted-glass grain).
-    // Fixed 32-iteration loop with a weight mask (no break) keeps frames cheap
-    // near the hinge and compiles everywhere.
+    // Fixed-length loops with a weight mask (no break) compile everywhere; the
+    // tap count follows the radius, so the loop length is picked from three
+    // sizes — near the hinge only 8 taps are paid for instead of 32. The blur
+    // radius varies smoothly across the screen, so neighbours share a branch.
     float tapsF = clamp(radius * 2.0, 6.0, 32.0);
     float rotation = fract(sin(dot(fragCoord, float2(12.9898, 78.233))) * 43758.5453) * TWO_PI;
     half3 sum = half3(0.0);
     float wsum = 0.0;
-    for (int i = 0; i < 32; i++) {
-        float fi = float(i);
-        float w = 1.0 - step(tapsF, fi);
-        float r = radius * sqrt((fi + 0.5) / tapsF);
-        float a = fi * GOLDEN_ANGLE + rotation;
-        sum += content.eval(hit + r * float2(cos(a), sin(a))).rgb * half(w);
-        wsum += w;
+    if (tapsF <= 8.0) {
+        for (int i = 0; i < 8; i++) {
+            float fi = float(i);
+            float w = 1.0 - step(tapsF, fi);
+            float r = radius * sqrt((fi + 0.5) / tapsF);
+            float a = fi * GOLDEN_ANGLE + rotation;
+            sum += content.eval(hit + r * float2(cos(a), sin(a))).rgb * half(w);
+            wsum += w;
+        }
+    } else if (tapsF <= 16.0) {
+        for (int i = 0; i < 16; i++) {
+            float fi = float(i);
+            float w = 1.0 - step(tapsF, fi);
+            float r = radius * sqrt((fi + 0.5) / tapsF);
+            float a = fi * GOLDEN_ANGLE + rotation;
+            sum += content.eval(hit + r * float2(cos(a), sin(a))).rgb * half(w);
+            wsum += w;
+        }
+    } else {
+        for (int i = 0; i < 32; i++) {
+            float fi = float(i);
+            float w = 1.0 - step(tapsF, fi);
+            float r = radius * sqrt((fi + 0.5) / tapsF);
+            float a = fi * GOLDEN_ANGLE + rotation;
+            sum += content.eval(hit + r * float2(cos(a), sin(a))).rgb * half(w);
+            wsum += w;
+        }
     }
     half3 avg = sum / half(max(wsum, 1.0));
     return half4(avg * half(atten), 1.0);

@@ -19,28 +19,12 @@ android {
 
     defaultConfig {
         applicationId = "com.duoopen"
-        // AGSL RuntimeShader needs API 33 (OnePlus Open ships Android 13+).
+        // AGSL RuntimeShader needs API 33; Samsung's device-state and sensor
+        // HAL behaviour this build relies on is from One UI 5 (Android 13) on.
         minSdk = 33
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.3.0"
-    }
-
-    // full: system-wide fold via the accessibility service (+ wallpaper).
-    // lite: live wallpaper only — no accessibility service in the manifest,
-    // so Play Protect / restricted settings never get involved. Separate app
-    // id so both can be installed side by side.
-    flavorDimensions += "edition"
-    productFlavors {
-        create("full") {
-            dimension = "edition"
-            isDefault = true
-        }
-        create("lite") {
-            dimension = "edition"
-            applicationIdSuffix = ".lite"
-            versionNameSuffix = "-lite"
-        }
+        versionCode = 6
+        versionName = "2.0.0"
     }
 
     signingConfigs {
@@ -88,10 +72,10 @@ dependencies {
     implementation("androidx.window:window:1.2.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
-    // Full edition only: optional Shizuku mode (ADB-level helpers — unlimited
-    // display capture with our overlay excluded, and Samsung's continuous
-    // hinge angle). Technique credit: joeconsorti/duo-fold-live (MIT).
-    "fullImplementation"("dev.rikka.shizuku:api:13.1.5")
-    "fullImplementation"("dev.rikka.shizuku:provider:13.1.5")
-    "fullImplementation"("org.lsposed.hiddenapibypass:hiddenapibypass:6.1")
+    // Shizuku mode (ADB-level helpers — unlimited display capture with our
+    // overlay excluded, Samsung's hinge angle and the early cover switch).
+    // Technique credit: joeconsorti/duo-fold-live (MIT).
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
+    implementation("org.lsposed.hiddenapibypass:hiddenapibypass:6.1")
 }

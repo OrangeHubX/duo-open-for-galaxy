@@ -36,6 +36,8 @@ object ShizukuBridge {
 
     private const val TAG = "DuoShizuku"
     private const val REQUEST_CODE = 7311
+    /** Keep in sync with the <queries> in src/full/AndroidManifest.xml. */
+    private val MANAGER_PACKAGES = listOf("moe.shizuku.privileged.api", "moe.shizuku.privileged.api.szuix")
 
     private val _state = MutableStateFlow<State>(State.NotInstalled)
     val state: StateFlow<State> = _state.asStateFlow()
@@ -58,6 +60,11 @@ object ShizukuBridge {
             service = null
             binding = false
             Log.i(TAG, "shell service disconnected")
+            // Shizuku restarts the helper but doesn't report it on this
+            // registration again: drop it and bind afresh, so the app hears
+            // about the new helper (and can, e.g., clear a device-state
+            // override the dead one left behind).
+            runCatching { Shizuku.unbindUserService(args(), this, false) }
             refresh()
         }
     }
@@ -80,15 +87,25 @@ object ShizukuBridge {
         refresh()
     }
 
+    /**
+     * The installed Shizuku manager: the official app or a fork that keeps its
+     * API but ships under its own package (thedjchi's build is `….szuix`).
+     */
+    val managerPackage: String?
+        get() = MANAGER_PACKAGES.firstOrNull { pkg ->
+            runCatching { appContext.packageManager.getPackageInfo(pkg, 0); true }.getOrDefault(false)
+        }
+
+    /** A live binder proves a manager is there even if its package isn't one we know. */
     val installed: Boolean
-        get() = runCatching { appContext.packageManager.getPackageInfo("moe.shizuku.privileged.api", 0); true }.getOrDefault(false)
+        get() = managerPackage != null || runCatching { Shizuku.pingBinder() }.getOrDefault(false)
 
     val ready: Boolean get() = state.value is State.Ready && service != null
 
     fun refresh() {
         val next: State = runCatching {
             when {
-                !installed && !Shizuku.pingBinder() -> State.NotInstalled
+                managerPackage == null && !Shizuku.pingBinder() -> State.NotInstalled
                 !Shizuku.pingBinder() -> State.NotRunning
                 Shizuku.isPreV11() -> State.NotRunning
                 Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED -> {
@@ -167,26 +184,25 @@ object ShizukuBridge {
         return b.getParcelable("bitmap")
     }
 
-    /** Receives angles from the shell-side wallpaper log reader. */
-    private class AngleCallback(private val onAngle: (Float) -> Unit) : Binder() {
+    /** Receives readings from the shell-side hinge-sensor log reader. */
+    private class AngleCallback(private val onAngle: (angle: Float, sampleUptimeMs: Long, source: Int) -> Unit) : Binder() {
         init { attachInterface(null, ShellProtocol.CALLBACK_TOKEN) }
         override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
             if (code != ShellProtocol.CB_ANGLE) return super.onTransact(code, data, reply, flags)
             data.enforceInterface(ShellProtocol.CALLBACK_TOKEN)
-            onAngle(data.readFloat())
+            val angle = data.readFloat()
+            val at = data.readLong()
+            onAngle(angle, at, data.readInt())
             return true
         }
     }
 
     private var angleCallback: AngleCallback? = null
 
-    fun startAngles(action: String, onAngle: (Float) -> Unit): Boolean {
+    fun startAngles(onAngle: (angle: Float, sampleUptimeMs: Long, source: Int) -> Unit): Boolean {
         val cb = AngleCallback(onAngle)
         angleCallback = cb
-        return call(ShellProtocol.START_ANGLES) { p ->
-            p.writeString(action)
-            p.writeStrongBinder(cb)
-        } != null
+        return call(ShellProtocol.START_ANGLES) { p -> p.writeStrongBinder(cb) } != null
     }
 
     fun stopAngles() {
@@ -195,4 +211,11 @@ object ShizukuBridge {
     }
 
     fun angleStatus(): Bundle? = call(ShellProtocol.ANGLE_STATUS)
+
+    /** Report [state] to the system as the physical device state; -1 hands back to the real one. */
+    fun overrideBaseState(state: Int): Boolean {
+        val b = call(ShellProtocol.BASE_STATE) { it.writeInt(state) } ?: return false
+        if (!b.getBoolean("ok")) Log.w(TAG, "base state $state failed: ${b.getString("error")}")
+        return b.getBoolean("ok")
+    }
 }

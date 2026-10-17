@@ -1,11 +1,12 @@
 # Third-party notices
 
-Duo Open is MIT-licensed (see LICENSE). It builds on, and is grateful to:
+This Samsung fork of Duo Open is MIT-licensed (see LICENSE). It builds on, and is grateful to:
 
 | Work | Where | License / credit |
 |---|---|---|
+| Duo Open — the original app this fork is based on | https://github.com/marcoazeem/duo-open | MIT (see LICENSE). |
 | Duo-animation — frosted-glass fold shader (Metal, ported to AGSL here) | https://github.com/Atomicx7/Duo-animation | No license file upstream; used with attribution. |
-| Duo Fold Live — Samsung fold-wallpaper angle source, shell-side display capture with layer exclusion, capture-API resolution | https://github.com/joeconsorti/duo-fold-live | MIT; Copyright (c) 2026 Duo Fold Live contributors. Techniques re-implemented in `app/src/full/java/com/duoopen/shell/`. |
+| Duo Fold Live — reading Samsung's fold angle from logcat, shell-side display capture with layer exclusion, capture-API resolution | https://github.com/joeconsorti/duo-fold-live | MIT; Copyright (c) 2026 Duo Fold Live contributors. Techniques re-implemented in `app/src/main/java/com/duoopen/shell/`. |
 | Shizuku API | https://github.com/RikkaApps/Shizuku-API | Apache-2.0 |
 | AndroidHiddenApiBypass | https://github.com/LSPosed/AndroidHiddenApiBypass | Apache-2.0 |
 

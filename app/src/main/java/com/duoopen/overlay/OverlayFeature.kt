@@ -1,9 +1,11 @@
 package com.duoopen.overlay
 
 import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import com.duoopen.fold.HingeAngleSource
 import android.view.WindowManager
 import com.duoopen.shell.ShizukuBridge
-import com.duoopen.shell.WallpaperAngleFeed
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -13,17 +15,18 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.SharingStarted
 
-/** Full edition: the system-wide fold via [FoldOverlayService], plus optional Shizuku helpers. */
+/** The system-wide fold via [FoldOverlayService], plus the Shizuku helpers. */
 object OverlayFeature {
-    const val AVAILABLE = true
-    const val SHIZUKU_AVAILABLE = true
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     /** Called once per process (app and service share it). */
     fun initProcess(context: Context) {
         runCatching {
-            org.lsposed.hiddenapibypass.HiddenApiBypass.addHiddenApiExemptions("Landroid/view/ViewRootImpl;")
+            org.lsposed.hiddenapibypass.HiddenApiBypass.addHiddenApiExemptions(
+                "Landroid/view/ViewRootImpl;",
+                "Landroid/hardware/devicestate/",
+            )
         }
         ShizukuBridge.init(context)
     }
@@ -50,13 +53,19 @@ object OverlayFeature {
 
     fun shizukuReady(): Boolean = ShizukuBridge.ready
     fun shizukuInstalled(): Boolean = ShizukuBridge.installed
+    fun shizukuPackage(): String? = ShizukuBridge.managerPackage
     fun shizukuNeedsPermission(): Boolean = ShizukuBridge.state.value is ShizukuBridge.State.NeedsPermission
     fun requestShizuku() = ShizukuBridge.requestPermission()
     fun refreshShizuku() = ShizukuBridge.refresh()
 
-    /** Whether Samsung's fold-reactive wallpaper (the continuous-angle source) is the home wallpaper. */
-    fun foldWallpaperActive(context: Context): Boolean = WallpaperAngleFeed.foldWallpaperActive(context)
+    /** The running service's hinge (Samsung's real angle with Shizuku), or null. */
+    fun hinge(): HingeAngleSource? = FoldOverlayService.instance?.hingeSource
 
-    /** Status of the continuous-angle reader, from the running service. */
+    /** A Samsung phone with a hinge: what this build is made for. */
+    fun supportedDevice(context: Context): Boolean =
+        Build.MANUFACTURER.equals("samsung", ignoreCase = true) &&
+            context.packageManager.hasSystemFeature(PackageManager.FEATURE_SENSOR_HINGE_ANGLE)
+
+    /** Status of the hinge-sensor reader, from the running service. */
     fun angleFeedStatus(): String = FoldOverlayService.instance?.angleFeedStatus() ?: "Service not running"
 }

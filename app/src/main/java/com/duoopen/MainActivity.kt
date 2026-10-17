@@ -53,8 +53,8 @@ class MainActivity : ComponentActivity() {
 
     /**
      * Converts a FoldingFeature into shader geometry and records which side of
-     * the display it splits, so the wallpaper (no WindowManager access) can
-     * place its hinge correctly in any rotation.
+     * the display it splits, so the overlay service (no activity window) can
+     * place the crease correctly in any rotation.
      */
     private fun learnFold(feature: FoldingFeature): FoldLine {
         val bounds = feature.bounds
