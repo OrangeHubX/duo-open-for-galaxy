@@ -1,4 +1,4 @@
-# Duo Open for Galaxy Z Fold
+# Duo Open for Galaxy
 
 The iPhone "Duo" frosted-glass fold, playing system-wide on a Samsung Galaxy
 Z Fold as you open and close it, following the real hinge angle. No root.
